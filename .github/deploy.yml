@@ -1,0 +1,27 @@
+name: SSH to EC2 and Clone Repo
+
+on:
+  workflow_dispatch:  # allows manual trigger from GitHub Actions tab
+
+jobs:
+  ssh-and-clone:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Connect to EC2, clone repo, and print contents
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSHKEY }}
+          script: |
+            echo "Connected to EC2..."
+            cd /home/${{ secrets.EC2_USER }}
+            rm -rf myrepo
+            git clone https://github.com/${{ github.repository }} myrepo
+            cd myrepo
+            echo "Repo contents:"
+            ls -la
