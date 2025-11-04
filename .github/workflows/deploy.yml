@@ -13,7 +13,7 @@ jobs:
       # Secret with the private key (PEM file contents)
       EC2_PEM: ${{ secrets.EC2_SSHKEY }}
       # Optional: specify SSH username in secrets, otherwise defaults to ec2-user
-      EC2_SSH_USER: ${{ secrets.EC2_USER }}
+      EC2_SSH_USER: ${{ secrets.EC2_SSH_USER }}
       # Path in repo where servers JSON lives
       SERVERS_JSON_PATH: "servers.json"
       # Remote path to deploy into (home folder of remote user will be used)
