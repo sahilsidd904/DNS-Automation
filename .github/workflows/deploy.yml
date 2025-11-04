@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Deploy and run app.py
+      - name: SSH into EC2 and run app.py
         env:
           SSH_USER: ${{ secrets.EC2_SSH_USER }}
           EC2_KEY: ${{ secrets.EC2_SSHKEY }}
@@ -20,17 +20,26 @@ jobs:
           chmod 600 ec2_key.pem
 
           mapfile -t IPS < <(jq -r '.servers[]' servers.json)
+
           for ip in "${IPS[@]}"; do
             echo "Deploying to $ip ..."
-            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" "
-              pkill -f 'python3 app.py' || true
-              cd ~/python-app || mkdir -p ~/python-app && cd ~/python-app
+
+            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" <<'EOF'
+              pkill -f "python3 app.py" || true
+              mkdir -p ~/python-app
+              cd ~/python-app
               nohup python3 app.py > output.log 2>&1 &
-            "
+              if [ $? -eq 0 ]; then
+                echo "✅ Successfully started app.py on $(hostname)"
+              else
+                echo "❌ Failed to start app.py on $(hostname)"
+              fi
+EOF
+
             if [ $? -eq 0 ]; then
-              echo "✅ Successfully started app.py on $ip"
+              echo "✅ Deployment succeeded on $ip"
             else
-              echo "❌ Failed to start app.py on $ip"
+              echo "❌ Deployment failed on $ip"
             fi
           done
 
