@@ -1,7 +1,9 @@
-name: Deploy Python app to EC2
+name: Deploy Python script to EC2
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -10,92 +12,62 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      # Secret with the private key (PEM file contents)
       EC2_PEM: ${{ secrets.EC2_SSHKEY }}
-      # Optional: specify SSH username in secrets, otherwise defaults to ec2-user
       EC2_SSH_USER: ${{ secrets.EC2_SSH_USER }}
-      # Path in repo where servers JSON lives
       SERVERS_JSON_PATH: "servers.json"
-      # Remote path to deploy into (home folder of remote user will be used)
-      REMOTE_APP_DIR: "app-deploy"
+      REMOTE_APP_DIR: "python-app"
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install helpers (jq, rsync)
+      - name: Install jq and rsync
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq rsync openssh-client
 
-      - name: Write PEM to a file (permissions secure)
+      - name: Write PEM file
         run: |
-          if [ -z "$EC2_PEM" ]; then
-            echo "EC2_PEM secret is empty. Aborting."
-            exit 1
-          fi
           echo "$EC2_PEM" > ec2_key.pem
           chmod 600 ec2_key.pem
 
-      - name: Read server IPs and deploy to each
+      - name: Read EC2 IPs and deploy
         env:
           SSH_USER: ${{ secrets.EC2_SSH_USER }}
           SERVERS_JSON_PATH: ${{ env.SERVERS_JSON_PATH }}
           REMOTE_APP_DIR: ${{ env.REMOTE_APP_DIR }}
         run: |
-          # default SSH user if not provided via secret
           SSH_USER="${SSH_USER:-ec2-user}"
 
-          # Check servers.json exists
           if [ ! -f "$SERVERS_JSON_PATH" ]; then
-            echo "Servers JSON not found at $SERVERS_JSON_PATH"
+            echo "Missing $SERVERS_JSON_PATH file"
             exit 1
           fi
 
-          # Expecting servers.json like: {"servers":["1.2.3.4","5.6.7.8"]}
           mapfile -t IPS < <(jq -r '.servers[]' "$SERVERS_JSON_PATH")
+
           if [ ${#IPS[@]} -eq 0 ]; then
             echo "No IPs found in $SERVERS_JSON_PATH"
             exit 1
           fi
 
-          echo "Found ${#IPS[@]} server(s)."
-
-          # Files to deploy — adjust as needed. Here we copy app.py and requirements.txt and any folder 'deploy/'.
-          # You can change the rsync include/exclude to suit your repo.
           for ip in "${IPS[@]}"; do
-            echo "---- Deploying to $ip ----"
+            echo "Deploying to $ip ..."
 
-            # create remote dir
             ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" "mkdir -p ~/${REMOTE_APP_DIR}"
 
-            # sync current repo root to remote app dir (excluding .git and workflow files)
             rsync -avz --delete --exclude='.git' --exclude='.github' -e "ssh -o StrictHostKeyChecking=no -i ec2_key.pem" ./ "${SSH_USER}@${ip}:~/${REMOTE_APP_DIR}/"
 
-            # Remote commands: create venv (if not exists), install requirements, and start app with nohup.
-            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -l -c "
-              set -e
+            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -c "'
               cd ~/${REMOTE_APP_DIR}
-              # create venv if missing
-              if [ ! -d venv ]; then
-                python3 -m venv venv || python -m venv venv
-              fi
-              . venv/bin/activate
-              if [ -f requirements.txt ]; then
-                pip install --upgrade pip
-                pip install -r requirements.txt
-              fi
-              # stop any previous app launched by this workflow (optional best-effort)
-              pkill -f 'python .*app.py' || true
-              # start the app (adjust command if entrypoint is different)
-              nohup python3 app.py > app.log 2>&1 &
-              echo 'Started app on' $(hostname)
-            "
-            echo "---- Done $ip ----"
+              pkill -f \"python3 your_script.py\" || true
+              nohup python3 your_script.py > output.log 2>&1 &
+              echo \"Started your_script.py on \$(hostname)\"
+            '"
+
+            echo "Deployed successfully to $ip"
           done
 
-      - name: Cleanup local PEM file
+      - name: Cleanup
         if: always()
-        run: |
-          shred -u ec2_key.pem || rm -f ec2_key.pem
-
+        run: rm -f ec2_key.pem
