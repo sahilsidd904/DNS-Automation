@@ -1,44 +1,81 @@
 name: Deploy app.py to EC2
 
 on:
+  push:
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    env:
+      SSH_USER: ubuntu
+      SERVERS_JSON_PATH: servers.json
+      REMOTE_DIR: python-app
+      LOCAL_SCRIPT: app.py
 
-      - name: SSH into EC2 and run app.py
-        env:
-          SSH_USER: ${{ secrets.EC2_SSH_USER }}
-          EC2_KEY: ${{ secrets.EC2_SSHKEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: sudo apt-get update -y && sudo apt-get install -y jq rsync openssh-client
+
+      - name: Write SSH key
         run: |
-          echo "$EC2_KEY" | sed 's/\r$//' > ec2_key.pem
+          if [ -z "${{ secrets.EC2_SSHKEY }}" ]; then
+            echo "ERROR: EC2_SSHKEY secret is empty"
+            exit 1
+          fi
+          echo "${{ secrets.EC2_SSHKEY }}" | sed 's/\r$//' > ec2_key.pem
           chmod 600 ec2_key.pem
 
-          mapfile -t IPS < <(jq -r '.servers[]' servers.json)
+      - name: Validate servers.json
+        run: |
+          if [ ! -f "$SERVERS_JSON_PATH" ]; then
+            echo "ERROR: $SERVERS_JSON_PATH not found"
+            ls -la
+            exit 1
+          fi
+          echo "Using servers:"
+          jq -r '.servers[]' "$SERVERS_JSON_PATH"
+
+      - name: Deploy app.py and run with nohup (no heredoc)
+        run: |
+          mapfile -t IPS < <(jq -r '.servers[]' "$SERVERS_JSON_PATH")
+          if [ ${#IPS[@]} -eq 0 ]; then
+            echo "No servers found in $SERVERS_JSON_PATH"
+            exit 1
+          fi
 
           for ip in "${IPS[@]}"; do
-            echo "Deploying to $ip ..."
+            echo "---- Deploying to $ip ----"
 
-            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" <<'EOF'
-              pkill -f "python3 app.py" || true
-              mkdir -p ~/python-app
-              cd ~/python-app
-              nohup python3 app.py > output.log 2>&1 &
-              if [ $? -eq 0 ]; then
-                echo "✅ Successfully started app.py on $(hostname)"
-              else
-                echo "❌ Failed to start app.py on $(hostname)"
-              fi
-EOF
+            # create remote dir (best-effort)
+            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" "mkdir -p ~/${REMOTE_DIR}" || {
+              echo "❌ Failed to create remote dir on $ip"
+              continue
+            }
 
-            if [ $? -eq 0 ]; then
-              echo "✅ Deployment succeeded on $ip"
+            # copy only app.py
+            rsync -az -e "ssh -o StrictHostKeyChecking=no -i ec2_key.pem" "$LOCAL_SCRIPT" "${SSH_USER}@${ip}:~/${REMOTE_DIR}/" || {
+              echo "❌ rsync failed for $ip"
+              continue
+            }
+
+            # Run remote commands in one properly quoted command (no heredoc)
+            # Use bash -lc so the remote interprets the command string as a shell command
+            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -lc $'cd ~/'"${REMOTE_DIR}"' && pkill -f "python3 '"${LOCAL_SCRIPT}"'" || true && nohup python3 '"${LOCAL_SCRIPT}"' > output.log 2>&1 & echo STARTED_OK' 2>&1 | sed "s/^/[${ip}] /"
+            rc=${PIPESTATUS[0]}
+
+            if [ $rc -eq 0 ]; then
+              echo "✅ Successfully started ${LOCAL_SCRIPT} on $ip"
             else
-              echo "❌ Deployment failed on $ip"
+              echo "❌ Failed to start ${LOCAL_SCRIPT} on $ip (ssh/remote command error, exit $rc)"
             fi
           done
 
-          rm -f ec2_key.pem
+      - name: Cleanup SSH key
+        if: always()
+        run: |
+          shred -u ec2_key.pem || rm -f ec2_key.pem
