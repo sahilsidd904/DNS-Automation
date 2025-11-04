@@ -1,9 +1,7 @@
 name: Deploy Python script to EC2
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,10 +10,12 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      EC2_PEM: ${{ secrets.EC2_SSHKEY }}
+      # Secrets mapped into env for clarity
       EC2_SSH_USER: ${{ secrets.EC2_SSH_USER }}
+      EC2_SSHKEY: ${{ secrets.EC2_SSHKEY }}
       SERVERS_JSON_PATH: "servers.json"
       REMOTE_APP_DIR: "python-app"
+      LOCAL_START_SCRIPT: "app.py"  # change to the script name you want to run
 
     steps:
       - name: Checkout repository
@@ -26,48 +26,79 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq rsync openssh-client
 
-      - name: Write PEM file
+      - name: Write SSH key file (strip CRLF and secure permissions)
         run: |
-          echo "$EC2_PEM" > ec2_key.pem
+          if [ -z "$EC2_SSHKEY" ]; then
+            echo "EC2_SSHKEY is empty. Please add the PEM contents to repo secrets."
+            exit 1
+          fi
+          # remove CRLF that may break SSH, then write key
+          echo "$EC2_SSHKEY" | sed 's/\r$//' > ec2_key.pem
           chmod 600 ec2_key.pem
+        shell: bash
 
-      - name: Read EC2 IPs and deploy
+      - name: Validate servers.json and list parsed IPs
+        run: |
+          if [ ! -f "$SERVERS_JSON_PATH" ]; then
+            echo "ERROR: $SERVERS_JSON_PATH not found in repo root."
+            ls -la
+            exit 1
+          fi
+          echo "servers.json:"
+          cat "$SERVERS_JSON_PATH"
+          echo "Parsed IPs:"
+          jq -r '.servers[]' "$SERVERS_JSON_PATH"
+        shell: bash
+
+      - name: Deploy to EC2 servers (no virtualenv; use nohup)
         env:
           SSH_USER: ${{ secrets.EC2_SSH_USER }}
           SERVERS_JSON_PATH: ${{ env.SERVERS_JSON_PATH }}
           REMOTE_APP_DIR: ${{ env.REMOTE_APP_DIR }}
+          LOCAL_START_SCRIPT: ${{ env.LOCAL_START_SCRIPT }}
         run: |
           SSH_USER="${SSH_USER:-ec2-user}"
 
-          if [ ! -f "$SERVERS_JSON_PATH" ]; then
-            echo "Missing $SERVERS_JSON_PATH file"
-            exit 1
-          fi
-
           mapfile -t IPS < <(jq -r '.servers[]' "$SERVERS_JSON_PATH")
-
           if [ ${#IPS[@]} -eq 0 ]; then
             echo "No IPs found in $SERVERS_JSON_PATH"
             exit 1
           fi
 
           for ip in "${IPS[@]}"; do
-            echo "Deploying to $ip ..."
+            echo "---- Deploying to $ip ----"
+            # create remote dir
+            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" "mkdir -p ~/${REMOTE_APP_DIR}" || {
+              echo "SSH mkdir failed for $ip"
+              continue
+            }
 
-            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" "mkdir -p ~/${REMOTE_APP_DIR}"
+            # rsync repo contents (exclude .git and .github)
+            rsync -az --delete --exclude='.git' --exclude='.github' -e "ssh -o StrictHostKeyChecking=no -i ec2_key.pem" ./ "${SSH_USER}@${ip}:~/${REMOTE_APP_DIR}/" || {
+              echo "rsync failed for $ip"
+              continue
+            }
 
-            rsync -avz --delete --exclude='.git' --exclude='.github' -e "ssh -o StrictHostKeyChecking=no -i ec2_key.pem" ./ "${SSH_USER}@${ip}:~/${REMOTE_APP_DIR}/"
-
-            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -c "'
+            # run remote commands: kill previous script (best-effort) and start with nohup
+            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -l -c "
+              set -e || true
               cd ~/${REMOTE_APP_DIR}
-              pkill -f \"python3 your_script.py\" || true
-              nohup python3 your_script.py > output.log 2>&1 &
-              echo \"Started your_script.py on \$(hostname)\"
-            '"
+              # best-effort stop previous process
+              pkill -f \"python3 ${LOCAL_START_SCRIPT}\" || true
+              # start in background with nohup
+              nohup python3 ${LOCAL_START_SCRIPT} > output.log 2>&1 &
+              echo 'Started ${LOCAL_START_SCRIPT} on' \$(hostname)
+            " || {
+              echo "remote start commands failed for $ip"
+              continue
+            }
 
-            echo "Deployed successfully to $ip"
+            echo "---- Done $ip ----"
           done
+        shell: bash
 
-      - name: Cleanup
+      - name: Cleanup SSH key
         if: always()
-        run: rm -f ec2_key.pem
+        run: |
+          shred -u ec2_key.pem || rm -f ec2_key.pem
+        shell: bash
