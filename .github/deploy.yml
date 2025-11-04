@@ -1,27 +1,73 @@
-name: SSH to EC2 and Clone Repo
+name: Deploy Python script to EC2
 
 on:
-  workflow_dispatch:  # allows manual trigger from GitHub Actions tab
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
 
 jobs:
-  ssh-and-clone:
+  deploy:
     runs-on: ubuntu-latest
+    env:
+      EC2_PEM: ${{ secrets.EC2_SSHKEY }}
+      EC2_SSH_USER: ${{ secrets.EC2_SSH_USER }}
+      SERVERS_JSON_PATH: "servers.json"
+      REMOTE_APP_DIR: "python-app"
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Connect to EC2, clone repo, and print contents
-        uses: appleboy/ssh-action@v0.1.10
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSHKEY }}
-          script: |
-            echo "Connected to EC2..."
-            cd /home/${{ secrets.EC2_USER }}
-            rm -rf myrepo
-            git clone https://github.com/${{ github.repository }} myrepo
-            cd myrepo
-            echo "Repo contents:"
-            ls -la
+      - name: Install jq and rsync
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq rsync openssh-client
+
+      - name: Write PEM file
+        run: |
+          echo "$EC2_PEM" > ec2_key.pem
+          chmod 600 ec2_key.pem
+
+      - name: Read EC2 IPs and deploy
+        env:
+          SSH_USER: ${{ secrets.EC2_SSH_USER }}
+          SERVERS_JSON_PATH: ${{ env.SERVERS_JSON_PATH }}
+          REMOTE_APP_DIR: ${{ env.REMOTE_APP_DIR }}
+        run: |
+          SSH_USER="${SSH_USER:-ec2-user}"
+
+          if [ ! -f "$SERVERS_JSON_PATH" ]; then
+            echo "Missing $SERVERS_JSON_PATH file"
+            exit 1
+          fi
+
+          mapfile -t IPS < <(jq -r '.servers[]' "$SERVERS_JSON_PATH")
+
+          if [ ${#IPS[@]} -eq 0 ]; then
+            echo "No IPs found in $SERVERS_JSON_PATH"
+            exit 1
+          fi
+
+          for ip in "${IPS[@]}"; do
+            echo "Deploying to $ip ..."
+
+            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" "mkdir -p ~/${REMOTE_APP_DIR}"
+
+            rsync -avz --delete --exclude='.git' --exclude='.github' -e "ssh -o StrictHostKeyChecking=no -i ec2_key.pem" ./ "${SSH_USER}@${ip}:~/${REMOTE_APP_DIR}/"
+
+            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -c "'
+              cd ~/${REMOTE_APP_DIR}
+              pkill -f \"python3 your_script.py\" || true
+              nohup python3 your_script.py > output.log 2>&1 &
+              echo \"Started your_script.py on \$(hostname)\"
+            '"
+
+            echo "Deployed successfully to $ip"
+          done
+
+      - name: Cleanup
+        if: always()
+        run: rm -f ec2_key.pem
