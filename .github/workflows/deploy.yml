@@ -9,56 +9,15 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    env:
-      # Secrets mapped into env for clarity
-      EC2_SSH_USER: ${{ secrets.EC2_SSH_USER }}
-      EC2_SSHKEY: ${{ secrets.EC2_SSHKEY }}
-      SERVERS_JSON_PATH: "servers.json"
-      REMOTE_APP_DIR: "python-app"
-      LOCAL_START_SCRIPT: "app.py"  # change to the script name you want to run
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install jq and rsync
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq rsync openssh-client
-
-      - name: Write SSH key file (strip CRLF and secure permissions)
-        run: |
-          if [ -z "$EC2_SSHKEY" ]; then
-            echo "EC2_SSHKEY is empty. Please add the PEM contents to repo secrets."
-            exit 1
-          fi
-          # remove CRLF that may break SSH, then write key
-          echo "$EC2_SSHKEY" | sed 's/\r$//' > ec2_key.pem
-          chmod 600 ec2_key.pem
-        shell: bash
-
-      - name: Validate servers.json and list parsed IPs
-        run: |
-          if [ ! -f "$SERVERS_JSON_PATH" ]; then
-            echo "ERROR: $SERVERS_JSON_PATH not found in repo root."
-            ls -la
-            exit 1
-          fi
-          echo "servers.json:"
-          cat "$SERVERS_JSON_PATH"
-          echo "Parsed IPs:"
-          jq -r '.servers[]' "$SERVERS_JSON_PATH"
-        shell: bash
-
-      - name: Deploy to EC2 servers (no virtualenv; use nohup)
+          - name: Deploy to EC2 servers (debug & verbose)
         env:
           SSH_USER: ${{ secrets.EC2_SSH_USER }}
-          SERVERS_JSON_PATH: ${{ env.SERVERS_JSON_PATH }}
-          REMOTE_APP_DIR: ${{ env.REMOTE_APP_DIR }}
-          LOCAL_START_SCRIPT: ${{ env.LOCAL_START_SCRIPT }}
+          SERVERS_JSON_PATH: "servers.json"
+          REMOTE_APP_DIR: "python-app"
+          LOCAL_START_SCRIPT: "your_script.py"
         run: |
           SSH_USER="${SSH_USER:-ec2-user}"
-
+          # read IPs
           mapfile -t IPS < <(jq -r '.servers[]' "$SERVERS_JSON_PATH")
           if [ ${#IPS[@]} -eq 0 ]; then
             echo "No IPs found in $SERVERS_JSON_PATH"
@@ -66,36 +25,104 @@ jobs:
           fi
 
           for ip in "${IPS[@]}"; do
-            echo "---- Deploying to $ip ----"
+            echo "================== Deploying to $ip =================="
             # create remote dir
             ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" "mkdir -p ~/${REMOTE_APP_DIR}" || {
               echo "SSH mkdir failed for $ip"
               continue
             }
 
-            # rsync repo contents (exclude .git and .github)
+            # rsync repo contents
             rsync -az --delete --exclude='.git' --exclude='.github' -e "ssh -o StrictHostKeyChecking=no -i ec2_key.pem" ./ "${SSH_USER}@${ip}:~/${REMOTE_APP_DIR}/" || {
               echo "rsync failed for $ip"
               continue
             }
 
-            # run remote commands: kill previous script (best-effort) and start with nohup
-            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -l -c "
-              set -e || true
-              cd ~/${REMOTE_APP_DIR}
-              # best-effort stop previous process
-              pkill -f \"python3 ${LOCAL_START_SCRIPT}\" || true
-              # start in background with nohup
-              nohup python3 ${LOCAL_START_SCRIPT} > output.log 2>&1 &
-              echo 'Started ${LOCAL_START_SCRIPT} on' \$(hostname)
-            " || {
-              echo "remote start commands failed for $ip"
-              continue
-            }
+            # Run verbose remote diagnostics + start script.
+            # We create a small remote shell script (remote_runner.sh), run it with 'bash -x' and print its output,
+            # so the GH Actions log contains the remote trace and any errors.
+            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -s <<'REMOTE_EOF' 2>&1 | sed "s/^/[${ip}] /"
+set -x
+set -o pipefail
 
-            echo "---- Done $ip ----"
+cd ~/"${REMOTE_APP_DIR}" || { echo "FAILED: cannot cd to ~/${REMOTE_APP_DIR}"; exit 2; }
+
+echo "----- REMOTE: pwd -----"
+pwd
+
+echo "----- REMOTE: ls -la -----"
+ls -la
+
+echo "----- REMOTE: which python3 -----"
+which python3 || true
+
+echo "----- REMOTE: python3 --version -----"
+python3 --version || true
+
+echo "----- REMOTE: show head of start script -----"
+if [ -f "${LOCAL_START_SCRIPT}" ]; then
+  head -n 40 "${LOCAL_START_SCRIPT}" || true
+else
+  echo "WARNING: ${LOCAL_START_SCRIPT} not found in $(pwd)"
+fi
+
+# Dump last 200 lines of previous output.log so we can see prior failures (if any)
+if [ -f output.log ]; then
+  echo "----- REMOTE: last 200 lines of output.log -----"
+  tail -n 200 output.log || true
+else
+  echo "----- REMOTE: output.log not present (that's OK) -----"
+fi
+
+# Create a wrapper script to start the app and capture logs/traces
+cat > remote_start_runner.sh <<'SH'
+#!/usr/bin/env bash
+set -x
+set -o pipefail
+
+# optional: record environment
+echo "ENV PATH=$PATH"
+echo "ENV whoami=$(whoami)"
+echo "ENV ulimit -a:"
+ulimit -a || true
+
+# best-effort stop previous matching processes - do not fail if pkill missing
+if command -v pkill >/dev/null 2>&1; then
+  pkill -f "python3 ${LOCAL_START_SCRIPT}" || true
+else
+  echo "pkill not found; skipping pkill"
+fi
+
+# Start script with nohup; redirect stdout/stderr to output.log
+nohup python3 "${LOCAL_START_SCRIPT}" > output.log 2>&1 &
+sleep 1
+# show the newly started background processes matching the script name
+ps aux | grep -E "python.*${LOCAL_START_SCRIPT}" | grep -v grep || true
+
+echo "REMOTE START: exit code $?"
+SH
+
+# make it executable and run it with bash -x, capture its stdout/stderr
+chmod +x remote_start_runner.sh || true
+bash -x remote_start_runner.sh || echo "remote_start_runner.sh returned non-zero"
+
+echo "----- REMOTE: tail output.log -----"
+if [ -f output.log ]; then
+  tail -n 200 output.log || true
+else
+  echo "No output.log produced by start command"
+fi
+
+echo "----- REMOTE: remote_start_runner.sh content -----"
+sed -n '1,200p' remote_start_runner.sh || true
+
+REMOTE_EOF
+
+            # show separation in logs
+            echo "================== Done $ip =================="
           done
         shell: bash
+
 
       - name: Cleanup SSH key
         if: always()
