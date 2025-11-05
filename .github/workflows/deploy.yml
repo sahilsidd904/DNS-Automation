@@ -1,4 +1,4 @@
-name: Deploy Flask app.py to EC2
+name: Deploy Flask app.py to EC2 (robust SSH)
 
 on:
   push:
@@ -17,72 +17,46 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install utilities
+      - name: Install runner tools
         run: sudo apt-get update -y && sudo apt-get install -y jq openssh-client git
 
-      - name: SSH into EC2 and deploy Flask app
+      - name: Deploy to EC2 (robust)
         env:
           EC2_KEY: ${{ secrets.EC2_SSHKEY }}
         run: |
+          # write key
           echo "$EC2_KEY" | sed 's/\r$//' > ec2_key.pem
           chmod 600 ec2_key.pem
 
-          if [ ! -f "$SERVERS_JSON_PATH" ]; then
-            echo "❌ servers.json not found!"
+          if [ ! -f "${SERVERS_JSON_PATH}" ]; then
+            echo "ERROR: ${SERVERS_JSON_PATH} not found"
             exit 1
           fi
 
-          mapfile -t IPS < <(jq -r '.servers[]' "$SERVERS_JSON_PATH")
+          mapfile -t IPS < <(jq -r '.servers[]' "${SERVERS_JSON_PATH}")
           if [ ${#IPS[@]} -eq 0 ]; then
-            echo "❌ No IPs found in servers.json!"
+            echo "ERROR: no servers listed"
             exit 1
           fi
 
           for ip in "${IPS[@]}"; do
-            echo "---- Deploying Flask app to $ip ----"
+            echo "---- Deploying to $ip ----"
 
-            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -lc $'
-              set -euo pipefail
-              export DEBIAN_FRONTEND=noninteractive
+            # Run remote steps; careful quoting to avoid heredoc/YAML escaping issues.
+            ssh -o BatchMode=yes \
+                -o ConnectTimeout=15 \
+                -o StrictHostKeyChecking=no \
+                -o ServerAliveInterval=60 \
+                -o ServerAliveCountMax=3 \
+                -i ec2_key.pem "${SSH_USER}@${ip}" bash -lc $'
+                  set -euo pipefail
+                  export DEBIAN_FRONTEND=noninteractive
 
-              echo "Installing Python and Git..."
-              sudo apt-get update -y -qq
-              sudo apt-get install -yq python3 python3-venv python3-pip git
+                  # Ensure python and git exist (apt should be noninteractive on typical EC2 ubuntu)
+                  sudo apt-get update -y -qq || true
+                  sudo apt-get install -yq python3 python3-venv python3-pip git || true
 
-              tmpdir=$(mktemp -d)
-              echo "Cloning repo into $tmpdir ..."
-              git clone --depth 1 https://x-access-token:'"${{ secrets.GITHUB_TOKEN }}"'@github.com/'"${{ github.repository }}"' "$tmpdir"
-              cd "$tmpdir"
-
-              echo "Creating virtual environment..."
-              python3 -m venv .venv
-              . .venv/bin/activate
-              pip install --upgrade pip
-              pip install flask
-
-              echo "Killing existing Flask app on port 5000 (if any)..."
-              sudo fuser -k 5000/tcp >/dev/null 2>&1 || true
-              pkill -f "python.*app.py" || true
-
-              echo "Starting Flask app using nohup..."
-              nohup .venv/bin/python app.py > output.log 2>&1 &
-              sleep 3
-
-              if pgrep -f "python.*app.py" >/dev/null 2>&1; then
-                echo "✅ Flask app started successfully on $(hostname)"
-                tail -n 10 output.log || true
-              else
-                echo "❌ Flask app failed to start on $(hostname)"
-                tail -n 40 output.log || true
-                exit 2
-              fi
-            '
-            rc=${PIPESTATUS[0]}
-            if [ $rc -eq 0 ]; then
-              echo "✅ Deployment succeeded on $ip"
-            else
-              echo "❌ Deployment failed on $ip (exit $rc)"
-            fi
-          done
-
-          rm -f ec2_key.pem
+                  # Clone repo into a temp dir (shallow)
+                  tmpdir=$(mktemp -d)
+                  echo "Cloning into $tmpdir"
+                  git clone --depth 1 https://x-access-token:'"${{ secrets.GITHUB_TOKEN }}"'@github.com/'"${{ gi_
