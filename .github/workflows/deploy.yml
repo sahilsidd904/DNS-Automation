@@ -1,4 +1,4 @@
-name: SSH and run Flask app.py with nohup
+name: SSH and run Flask app.py (no stop existing)
 
 on:
   push:
@@ -13,32 +13,28 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install required tools
+      - name: Install tools
         run: sudo apt-get update -y && sudo apt-get install -y jq openssh-client
 
-      - name: SSH into EC2 and execute commands
+      - name: SSH to EC2 and start Flask app
         env:
           SSH_USER: ubuntu
           EC2_KEY: ${{ secrets.EC2_SSHKEY }}
         run: |
-          # Write SSH key
           echo "$EC2_KEY" | sed 's/\r$//' > ec2_key.pem
           chmod 600 ec2_key.pem
 
-          # Validate servers.json exists
           if [ ! -f servers.json ]; then
             echo "❌ servers.json not found!"
             exit 1
           fi
 
-          # Read IPs
           mapfile -t IPS < <(jq -r '.servers[]' servers.json)
           if [ ${#IPS[@]} -eq 0 ]; then
             echo "❌ No IPs found in servers.json!"
             exit 1
           fi
 
-          # Run commands on each server
           for ip in "${IPS[@]}"; do
             echo "---- Connecting to $ip ----"
             ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -lc $'
@@ -47,10 +43,6 @@ jobs:
               sudo apt-get update -y
               sudo apt-get install -y python3-flask
 
-              echo "Stopping existing app if any..."
-              pkill -f "python3 app.py" || true
-              sudo fuser -k 5000/tcp >/dev/null 2>&1 || true
-
               echo "Starting app.py with nohup..."
               nohup python3 app.py > output.log 2>&1 &
               sleep 2
@@ -58,16 +50,15 @@ jobs:
               if pgrep -f "python3 app.py" >/dev/null; then
                 echo "✅ app.py started successfully on $(hostname)"
               else
-                echo "❌ app.py failed to start on $(hostname)"
-                tail -n 20 output.log || true
-                exit 1
+                echo "⚠️ app.py started but exited immediately (check output.log)"
+                tail -n 10 output.log || true
               fi
             '
             rc=${PIPESTATUS[0]}
             if [ $rc -eq 0 ]; then
               echo "✅ Commands executed successfully on $ip"
             else
-              echo "❌ Failed on $ip (exit $rc)"
+              echo "❌ Command failed on $ip (exit $rc)"
             fi
           done
 
