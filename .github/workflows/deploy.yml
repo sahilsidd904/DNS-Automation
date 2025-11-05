@@ -1,4 +1,4 @@
-name: Deploy Flask app.py to EC2 (robust SSH)
+name: SSH and run Flask app.py with nohup
 
 on:
   push:
@@ -8,99 +8,67 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    env:
-      SSH_USER: ubuntu
-      SERVERS_JSON_PATH: servers.json
-      LOCAL_SCRIPT: app.py
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install runner tools
-        run: sudo apt-get update -y && sudo apt-get install -y jq openssh-client git
+      - name: Install required tools
+        run: sudo apt-get update -y && sudo apt-get install -y jq openssh-client
 
-      - name: Deploy to EC2 (robust)
+      - name: SSH into EC2 and execute commands
         env:
+          SSH_USER: ubuntu
           EC2_KEY: ${{ secrets.EC2_SSHKEY }}
         run: |
-          # write key
+          # Write SSH key
           echo "$EC2_KEY" | sed 's/\r$//' > ec2_key.pem
           chmod 600 ec2_key.pem
 
-          if [ ! -f "${SERVERS_JSON_PATH}" ]; then
-            echo "ERROR: ${SERVERS_JSON_PATH} not found"
+          # Validate servers.json exists
+          if [ ! -f servers.json ]; then
+            echo "❌ servers.json not found!"
             exit 1
           fi
 
-          mapfile -t IPS < <(jq -r '.servers[]' "${SERVERS_JSON_PATH}")
+          # Read IPs
+          mapfile -t IPS < <(jq -r '.servers[]' servers.json)
           if [ ${#IPS[@]} -eq 0 ]; then
-            echo "ERROR: no servers listed"
+            echo "❌ No IPs found in servers.json!"
             exit 1
           fi
 
+          # Run commands on each server
           for ip in "${IPS[@]}"; do
-            echo "---- Deploying to $ip ----"
+            echo "---- Connecting to $ip ----"
+            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -lc $'
+              set -e
+              echo "Installing Flask..."
+              sudo apt-get update -y
+              sudo apt-get install -y python3-flask
 
-            # Run remote steps; careful quoting to avoid heredoc/YAML escaping issues.
-            ssh -o BatchMode=yes \
-                -o ConnectTimeout=15 \
-                -o StrictHostKeyChecking=no \
-                -o ServerAliveInterval=60 \
-                -o ServerAliveCountMax=3 \
-                -i ec2_key.pem "${SSH_USER}@${ip}" bash -lc $'
-                  set -euo pipefail
-                  export DEBIAN_FRONTEND=noninteractive
+              echo "Stopping existing app if any..."
+              pkill -f "python3 app.py" || true
+              sudo fuser -k 5000/tcp >/dev/null 2>&1 || true
 
-                  # Ensure python and git exist (apt should be noninteractive on typical EC2 ubuntu)
-                  sudo apt-get update -y -qq || true
-                  sudo apt-get install -yq python3 python3-venv python3-pip git || true
+              echo "Starting app.py with nohup..."
+              nohup python3 app.py > output.log 2>&1 &
+              sleep 2
 
-                  # Clone repo into a temp dir (shallow)
-                  tmpdir=$(mktemp -d)
-                  echo "Cloning into $tmpdir"
-                  git clone --depth 1 https://x-access-token:'"${{ secrets.GITHUB_TOKEN }}"'@github.com/'"${{ github.repository }}"' "$tmpdir"
-
-                  cd "$tmpdir"
-
-                  # Create venv and install flask (won't install system-wide)
-                  python3 -m venv .venv
-                  . .venv/bin/activate
-                  python -m pip install --upgrade pip
-                  pip install flask || true
-
-                  # kill any existing app on port 5000 (no sudo if possible)
-                  sudo fuser -k 5000/tcp >/dev/null 2>&1 || true
-                  pkill -f "python.*'"${LOCAL_SCRIPT}"'" || true
-
-                  # start the app with nohup, & disown so ssh session can close cleanly
-                  nohup .venv/bin/python '"${LOCAL_SCRIPT}"' > output.log 2>&1 &
-                  disown || true
-
-                  # small sleep and verification
-                  sleep 2
-                  if pgrep -f "python.*'"${LOCAL_SCRIPT}"'" >/dev/null 2>&1; then
-                    echo "STARTED_OK"
-                    # print a bit of the log for visibility
-                    tail -n 20 output.log || true
-                    exit 0
-                  else
-                    echo "START_FAILED"
-                    tail -n 200 output.log || true
-                    exit 2
-                  fi
-                ' 2>&1 | sed "s/^/[${ip}] /"
-
+              if pgrep -f "python3 app.py" >/dev/null; then
+                echo "✅ app.py started successfully on $(hostname)"
+              else
+                echo "❌ app.py failed to start on $(hostname)"
+                tail -n 20 output.log || true
+                exit 1
+              fi
+            '
             rc=${PIPESTATUS[0]}
             if [ $rc -eq 0 ]; then
-              echo "✅ Deployment succeeded on $ip"
+              echo "✅ Commands executed successfully on $ip"
             else
-              echo "❌ Deployment failed on $ip (exit $rc). See prefixed logs above."
+              echo "❌ Failed on $ip (exit $rc)"
             fi
-
-            # try fetching output.log (best-effort)
-            echo "Collecting output.log from $ip (if present):"
-            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" "cat $(ls -d /tmp/* 2>/dev/null | head -n1)/output.log 2>/dev/null || cat ./output.log 2>/dev/null || echo 'no output.log found on host'" 2>/dev/null | sed "s/^/[${ip} output] /" || true
           done
 
           rm -f ec2_key.pem
