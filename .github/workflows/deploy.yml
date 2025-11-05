@@ -1,126 +1,53 @@
-name: Deploy by SSH — clone & run app.py
+name: Deploy app.py via SSH
 
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
 
-env:
-  SERVERS_JSON_PATH: servers.json
-  REMOTE_DIR: app-repo
-  LOCAL_SCRIPT: app.py
-  SSH_USER: ubuntu
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout (so repo metadata is available)
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install helpers
-        run: sudo apt-get update -y && sudo apt-get install -y jq rsync openssh-client
+      - name: Install dependencies
+        run: sudo apt-get update -y && sudo apt-get install -y jq openssh-client git
 
-      - name: Write SSH key
+      - name: Deploy to EC2 servers
+        env:
+          SSH_USER: ubuntu
+          EC2_KEY: ${{ secrets.EC2_SSHKEY }}
         run: |
-          if [ -z "${{ secrets.EC2_SSHKEY }}" ]; then
-            echo "ERROR: EC2_SSHKEY secret is empty"
-            exit 1
-          fi
-          echo "${{ secrets.EC2_SSHKEY }}" | sed 's/\r$//' > ec2_key.pem
+          echo "$EC2_KEY" | sed 's/\r$//' > ec2_key.pem
           chmod 600 ec2_key.pem
 
-      - name: Validate servers.json
-        run: |
-          if [ ! -f "${SERVERS_JSON_PATH}" ]; then
-            echo "ERROR: ${SERVERS_JSON_PATH} not found in repo root"
-            ls -la
+          if [ ! -f servers.json ]; then
+            echo "❌ servers.json not found!"
             exit 1
           fi
-          echo "Servers:"
-          jq -r '.servers[]' "${SERVERS_JSON_PATH}"
 
-      - name: Clone repo on EC2 and run app.py with nohup
-        env:
-          SSH_USER: ${{ env.SSH_USER }}
-          SERVERS_JSON_PATH: ${{ env.SERVERS_JSON_PATH }}
-          REMOTE_DIR: ${{ env.REMOTE_DIR }}
-          LOCAL_SCRIPT: ${{ env.LOCAL_SCRIPT }}
-          REPO_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
-          REPO_REF: ${{ github.ref }}
-        run: |
-          mapfile -t IPS < <(jq -r '.servers[]' "${SERVERS_JSON_PATH}")
-          if [ ${#IPS[@]} -eq 0 ]; then
-            echo "No servers found in ${SERVERS_JSON_PATH}"
-            exit 1
-          fi
+          mapfile -t IPS < <(jq -r '.servers[]' servers.json)
 
           for ip in "${IPS[@]}"; do
             echo "---- Deploying to $ip ----"
-
-            # Attempt to create remote dir parent
-            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" "mkdir -p ~/${REMOTE_DIR}" || {
-              echo "❌ SSH mkdir failed for $ip - skipping host"
-              continue
-            }
-
-            # On remote: ensure git available, clone (or pull if exists), checkout the pushed ref, kill old app, start new one
-            # Use bash -lc with a single quoted $'...' string to avoid heredoc/YAML quoting problems.
             ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -lc $'
               set -e
-              cd ~/'"${REMOTE_DIR}"' || mkdir -p ~/'"${REMOTE_DIR}"' && cd ~/'"${REMOTE_DIR}"'
-              # ensure git exists (install if missing)
-              if ! command -v git >/dev/null 2>&1; then
-                sudo apt-get update -y && sudo apt-get install -y git
-              fi
-
-              # If repo already cloned, fetch & reset; otherwise clone fresh into current dir
-              if [ -d .git ]; then
-                git fetch --all --prune
-                git reset --hard '"${GITHUB_SHA:-HEAD}"' || true
+              tmpdir=$(mktemp -d)
+              echo "Cloning repo into $tmpdir ..."
+              git clone https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git "$tmpdir"
+              cd "$tmpdir"
+              echo "Running app.py with nohup ..."
+              nohup python3 app.py > output.log 2>&1 &
+              sleep 3
+              if pgrep -f "python3 app.py" >/dev/null; then
+                echo "✅ app.py started successfully on $(hostname)"
               else
-                # clone into a temp dir then move contents into place (to avoid nesting)
-                tmpdir=$(mktemp -d)
-                git clone --depth 1 "'"${REPO_URL}"'" "$tmpdir"
-                rsync -a --delete "$tmpdir"/ ./
-                rm -rf "$tmpdir"
+                echo "❌ app.py failed to start on $(hostname)"
               fi
-
-              # Try to checkout the current ref if available
-              if [ -n "'"${GITHUB_SHA}"'" ]; then
-                git checkout -f "'"${GITHUB_SHA}"'" || true
-              fi
-
-              # best-effort stop previous process
-              pkill -f "python3 '"${LOCAL_SCRIPT}"'" || true
-
-              # start the app with nohup on port 5000 (or whatever your script uses)
-              nohup python3 "'"${LOCAL_SCRIPT}"'" > output.log 2>&1 &
-
-              # short sleep to allow process to come up and then show status
-              sleep 1
-              if pgrep -f "python3 '"${LOCAL_SCRIPT}"'" >/dev/null 2>&1; then
-                echo "STARTED_OK"
-                echo "Running processes:"
-                pgrep -a -f "'"${LOCAL_SCRIPT}"'"
-              else
-                echo "START_FAILED"
-                tail -n 100 output.log || true
-                exit 2
-              fi
-            ' 2>&1 | sed "s/^/[${ip}] /"
-            rc=${PIPESTATUS[0]}
-
-            if [ $rc -eq 0 ]; then
-              echo "✅ Successfully deployed and started ${LOCAL_SCRIPT} on $ip"
-            else
-              echo "❌ Deployment or start failed on $ip (exit $rc). See logs above."
-            fi
+            '
           done
-        shell: bash
 
-      - name: Cleanup SSH key
-        if: always()
-        run: |
-          shred -u ec2_key.pem || rm -f ec2_key.pem
+          rm -f ec2_key.pem
