@@ -1,4 +1,4 @@
-name: Deploy app.py via SSH
+name: Deploy app.py via SSH (with Flask install)
 
 on:
   push:
@@ -35,17 +35,25 @@ jobs:
             echo "---- Deploying to $ip ----"
             ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -lc $'
               set -e
+              sudo apt-get update -y
+              sudo apt-get install -y python3 python3-pip git
+              pip3 install --upgrade pip
+              pip3 install flask
+
               tmpdir=$(mktemp -d)
               echo "Cloning repo into $tmpdir ..."
               git clone https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git "$tmpdir"
               cd "$tmpdir"
+
               echo "Running app.py with nohup ..."
               nohup python3 app.py > output.log 2>&1 &
               sleep 3
+
               if pgrep -f "python3 app.py" >/dev/null; then
                 echo "✅ app.py started successfully on $(hostname)"
               else
                 echo "❌ app.py failed to start on $(hostname)"
+                tail -n 20 output.log || true
               fi
             '
           done
