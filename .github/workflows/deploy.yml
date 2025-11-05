@@ -1,4 +1,4 @@
-name: Clone, copy app.py and run commands on EC2
+name: Copy app.py, install flask, and run with nohup
 
 on:
   push:
@@ -15,7 +15,7 @@ jobs:
       LOCAL_SCRIPT: app.py
 
     steps:
-      - name: Checkout repo (so app.py is available on runner)
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install runner tools
@@ -30,7 +30,7 @@ jobs:
           echo "${{ secrets.EC2_SSHKEY }}" | sed 's/\r$//' > ec2_key.pem
           chmod 600 ec2_key.pem
 
-      - name: Validate servers.json & ensure app.py exists
+      - name: Validate files
         run: |
           if [ ! -f "$SERVERS_JSON_PATH" ]; then
             echo "ERROR: $SERVERS_JSON_PATH not found"
@@ -38,14 +38,13 @@ jobs:
             exit 1
           fi
           if [ ! -f "$LOCAL_SCRIPT" ]; then
-            echo "ERROR: $LOCAL_SCRIPT not found in repo root"
+            echo "ERROR: $LOCAL_SCRIPT not found"
             ls -la
             exit 1
           fi
-          echo "Servers:"
           jq -r '.servers[]' "$SERVERS_JSON_PATH"
 
-      - name: Copy app.py and run commands on each EC2
+      - name: Copy app.py and install flask + run nohup (no noninteractive)
         env:
           SSH_USER: ${{ env.SSH_USER }}
           SERVERS_JSON_PATH: ${{ env.SERVERS_JSON_PATH }}
@@ -61,46 +60,39 @@ jobs:
           for ip in "${IPS[@]}"; do
             echo "---- Processing $ip ----"
 
-            # create remote dir (best-effort)
+            # ensure remote directory exists
             ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" "mkdir -p ~/${REMOTE_DIR}" || {
               echo "❌ Could not create remote directory on $ip; skipping"
               continue
             }
 
-            # copy only app.py to remote
+            # copy app.py
             echo "Copying ${LOCAL_SCRIPT} to ${ip}:~/${REMOTE_DIR}/"
             rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i ec2_key.pem" "$LOCAL_SCRIPT" "${SSH_USER}@${ip}:~/${REMOTE_DIR}/" || {
               echo "❌ rsync failed for $ip; skipping"
               continue
             }
 
-            echo "Running remote commands on $ip ..."
-            # Run apt install noninteractive and start app with nohup (do NOT stop existing apps)
+            echo "Running remote install and start commands on $ip ..."
             ssh -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -lc $'
-              set -euo pipefail
-              export DEBIAN_FRONTEND=noninteractive
+              set -e
+              echo "Updating apt..."
+              sudo apt-get update -y
+              echo "Installing python3-flask (may prompt)..."
+              sudo apt-get install -y python3-flask
 
-              echo "Updating apt and installing python3-flask (noninteractive)..."
-              sudo apt-get update -y -qq
-              # noninteractive install to avoid debconf prompts
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
-                python3-flask || echo "WARNING: apt install returned non-zero (check)"
+              cd ~/'"${REMOTE_DIR}"' || { echo "ERROR: cannot cd to ~/'"${REMOTE_DIR}"'"; exit 2; }
 
-              # ensure remote dir and move into it
-              cd ~/'"${REMOTE_DIR}"' || { echo "ERROR: cannot cd to remote dir"; exit 2; }
-
-              echo "Starting ${LOCAL_SCRIPT} with nohup (will not stop existing apps)..."
+              echo "Starting '"${LOCAL_SCRIPT}"' with nohup (will not stop existing apps)..."
               nohup python3 '"${LOCAL_SCRIPT}"' > output.log 2>&1 &
 
-              # brief sleep and check
               sleep 2
               if pgrep -f "python3 '"${LOCAL_SCRIPT}"'" >/dev/null 2>&1; then
                 echo "✅ ${LOCAL_SCRIPT} started on $(hostname)"
                 tail -n 8 output.log || true
-                exit 0
               else
                 echo "⚠️ ${LOCAL_SCRIPT} did not remain running on $(hostname) (check output.log)"
-                tail -n 50 output.log || true
+                tail -n 40 output.log || true
                 exit 3
               fi
             ' 2>&1 | sed "s/^/[${ip}] /"
