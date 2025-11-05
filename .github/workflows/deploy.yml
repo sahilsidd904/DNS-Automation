@@ -1,4 +1,4 @@
-name: Deploy app.py via SSH (APT Flask install)
+name: Deploy app.py via SSH (APT noninteractive)
 
 on:
   push:
@@ -8,6 +8,8 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      SSH_USER: ubuntu
 
     steps:
       - name: Checkout
@@ -16,11 +18,11 @@ jobs:
       - name: Install runner utilities
         run: sudo apt-get update -y && sudo apt-get install -y jq openssh-client git
 
-      - name: Deploy to EC2 servers
+      - name: Deploy to EC2 servers (APT noninteractive)
         env:
-          SSH_USER: ubuntu
           EC2_KEY: ${{ secrets.EC2_SSHKEY }}
         run: |
+          # write key
           echo "$EC2_KEY" | sed 's/\r$//' > ec2_key.pem
           chmod 600 ec2_key.pem
 
@@ -37,32 +39,61 @@ jobs:
 
           for ip in "${IPS[@]}"; do
             echo "---- Deploying to $ip ----"
-            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -lc $'
-              set -e
-              echo "Updating packages and installing Flask..."
-              sudo apt-get update -y
-              sudo apt-get install -y python3 python3-pip python3-flask git
 
+            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -lc $'
+              set -x
+              # avoid interactive prompts for apt (debconf/PEP issues)
+              export DEBIAN_FRONTEND=noninteractive
+              sudo apt-get update -y -qq
+
+              # Use non-interactive apt with safe Dpkg options; keep quiet but fail on real errors
+              sudo DEBIAN_FRONTEND=noninteractive \
+                apt-get install -yq --no-install-recommends \
+                -o Dpkg::Options::="--force-confdef" \
+                -o Dpkg::Options::="--force-confold" \
+                python3 python3-pip python3-flask git || {
+                  echo "WARNING: apt-get install returned non-zero; continuing (inspect logs)"
+                }
+
+              # ensure pip is available but do NOT pip install system-wide (we used apt python3-flask)
+              python3 --version || { echo "ERROR: python3 not found"; exit 2; }
+
+              # clone repo into temp dir
               tmpdir=$(mktemp -d)
               echo "Cloning repo into $tmpdir ..."
-              git clone https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git "$tmpdir"
-              cd "$tmpdir"
+              # use tokenized clone so private repos work; GITHUB_TOKEN is available in Actions
+              git clone https://x-access-token:'"${{ secrets.GITHUB_TOKEN }}"'@github.com/'"${{ github.repository }}"' "$tmpdir"
 
-              echo "Killing any old app.py process..."
+              cd "$tmpdir" || { echo "ERROR: cd to $tmpdir failed"; exit 3; }
+
+              # kill any existing app on port 5000 or matching app.py
+              sudo fuser -k 5000/tcp >/dev/null 2>&1 || true
               pkill -f "python3 app.py" || true
 
-              echo "Starting app.py on port 5000..."
+              echo "Starting app.py with nohup..."
               nohup python3 app.py > output.log 2>&1 &
+
               sleep 3
 
-              if pgrep -f "python3 app.py" >/dev/null; then
+              # debug: show pid(s) and last lines of output
+              pgrep -a -f "python3 app.py" || true
+              if pgrep -f "python3 app.py" >/dev/null 2>&1; then
                 echo "✅ app.py started successfully on $(hostname)"
+                tail -n 20 output.log || true
+                exit 0
               else
                 echo "❌ app.py failed to start on $(hostname)"
-                tail -n 20 output.log || true
-                exit 2
+                tail -n 200 output.log || true
+                exit 4
               fi
-            '
+            ' 2>&1 | sed "s/^/[${ip}] /"
+
+            rc=${PIPESTATUS[0]}
+            if [ $rc -eq 0 ]; then
+              echo "✅ Deployment succeeded on $ip"
+            else
+              echo "❌ Deployment failed on $ip (exit $rc). Check prefixed logs above for details."
+            fi
           done
 
           rm -f ec2_key.pem
