@@ -80,6 +80,7 @@ jobs:
               sudo apt-get update -y
               echo "Installing python3-flask (may prompt)..."
               sudo apt-get install -y python3-flask
+              sudo fuser -k 5000/tcp || true
 
               cd ~/'"${REMOTE_DIR}"' || { echo "ERROR: cannot cd to ~/'"${REMOTE_DIR}"'"; exit 2; }
 
