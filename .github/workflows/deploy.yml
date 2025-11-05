@@ -1,4 +1,4 @@
-name: Deploy app.py via SSH (venv on remote)
+name: Deploy Flask app.py to EC2
 
 on:
   push:
@@ -11,95 +11,77 @@ jobs:
     env:
       SSH_USER: ubuntu
       SERVERS_JSON_PATH: servers.json
-      REMOTE_TMP_PARENT: /tmp
       LOCAL_SCRIPT: app.py
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install runner utilities
-        run: sudo apt-get update -y && sudo apt-get install -y jq openssh-client
+      - name: Install utilities
+        run: sudo apt-get update -y && sudo apt-get install -y jq openssh-client git
 
-      - name: Deploy to EC2 servers (create venv, install deps, run app)
+      - name: SSH into EC2 and deploy Flask app
         env:
           EC2_KEY: ${{ secrets.EC2_SSHKEY }}
         run: |
-          # write key
           echo "$EC2_KEY" | sed 's/\r$//' > ec2_key.pem
           chmod 600 ec2_key.pem
 
           if [ ! -f "$SERVERS_JSON_PATH" ]; then
-            echo "ERROR: $SERVERS_JSON_PATH not found"
+            echo "❌ servers.json not found!"
             exit 1
           fi
 
           mapfile -t IPS < <(jq -r '.servers[]' "$SERVERS_JSON_PATH")
           if [ ${#IPS[@]} -eq 0 ]; then
-            echo "ERROR: no servers in $SERVERS_JSON_PATH"
+            echo "❌ No IPs found in servers.json!"
             exit 1
           fi
 
           for ip in "${IPS[@]}"; do
-            echo "---- Deploying to $ip ----"
+            echo "---- Deploying Flask app to $ip ----"
 
             ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -lc $'
               set -euo pipefail
               export DEBIAN_FRONTEND=noninteractive
 
-              # ensure required system packages are present for venv and git
+              echo "Installing Python and Git..."
               sudo apt-get update -y -qq
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
-                python3 python3-venv python3-pip git || {
-                  echo "WARNING: apt-get install returned non-zero; continuing"
-                }
+              sudo apt-get install -yq python3 python3-venv python3-pip git
 
-              # create a temp dir and clone repository
               tmpdir=$(mktemp -d)
               echo "Cloning repo into $tmpdir ..."
               git clone --depth 1 https://x-access-token:'"${{ secrets.GITHUB_TOKEN }}"'@github.com/'"${{ github.repository }}"' "$tmpdir"
               cd "$tmpdir"
 
-              # create virtual environment
-              echo "Creating venv at .venv ..."
+              echo "Creating virtual environment..."
               python3 -m venv .venv
-              # activate and upgrade pip inside venv
               . .venv/bin/activate
-              python -m pip install --upgrade pip
+              pip install --upgrade pip
+              pip install flask
 
-              # install requirements if present, otherwise ensure flask at least
-              if [ -f requirements.txt ]; then
-                pip install -r requirements.txt || (echo "pip install -r requirements.txt failed; attempting pip install flask" && pip install flask)
-              else
-                pip install flask || true
-              fi
-
-              # kill any existing app.py process (by name or port)
+              echo "Killing existing Flask app on port 5000 (if any)..."
               sudo fuser -k 5000/tcp >/dev/null 2>&1 || true
-              pkill -f "python .*'"${LOCAL_SCRIPT}"'" || true
+              pkill -f "python.*app.py" || true
 
-              # start the app using venv python
-              echo "Starting '"${LOCAL_SCRIPT}"' with venv python (nohup) ..."
-              nohup .venv/bin/python '"${LOCAL_SCRIPT}"' > output.log 2>&1 &
+              echo "Starting Flask app using nohup..."
+              nohup .venv/bin/python app.py > output.log 2>&1 &
               sleep 3
 
-              # verify process started
-              if pgrep -f "python.*'"${LOCAL_SCRIPT}"'" >/dev/null 2>&1; then
-                echo "✅ ${LOCAL_SCRIPT} started successfully on $(hostname)"
-                tail -n 40 output.log || true
-                exit 0
+              if pgrep -f "python.*app.py" >/dev/null 2>&1; then
+                echo "✅ Flask app started successfully on $(hostname)"
+                tail -n 10 output.log || true
               else
-                echo "❌ ${LOCAL_SCRIPT} failed to start on $(hostname)"
-                tail -n 200 output.log || true
+                echo "❌ Flask app failed to start on $(hostname)"
+                tail -n 40 output.log || true
                 exit 2
               fi
-            ' 2>&1 | sed "s/^/[${ip}] /"
-
+            '
             rc=${PIPESTATUS[0]}
             if [ $rc -eq 0 ]; then
               echo "✅ Deployment succeeded on $ip"
             else
-              echo "❌ Deployment failed on $ip (exit $rc). See prefixed log above."
+              echo "❌ Deployment failed on $ip (exit $rc)"
             fi
           done
 
