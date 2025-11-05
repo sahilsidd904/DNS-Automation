@@ -59,4 +59,48 @@ jobs:
                   # Clone repo into a temp dir (shallow)
                   tmpdir=$(mktemp -d)
                   echo "Cloning into $tmpdir"
-                  git clone --depth 1 https://x-access-token:'"${{ secrets.GITHUB_TOKEN }}"'@github.com/'"${{ gi_
+                  git clone --depth 1 https://x-access-token:'"${{ secrets.GITHUB_TOKEN }}"'@github.com/'"${{ github.repository }}"' "$tmpdir"
+
+                  cd "$tmpdir"
+
+                  # Create venv and install flask (won't install system-wide)
+                  python3 -m venv .venv
+                  . .venv/bin/activate
+                  python -m pip install --upgrade pip
+                  pip install flask || true
+
+                  # kill any existing app on port 5000 (no sudo if possible)
+                  sudo fuser -k 5000/tcp >/dev/null 2>&1 || true
+                  pkill -f "python.*'"${LOCAL_SCRIPT}"'" || true
+
+                  # start the app with nohup, & disown so ssh session can close cleanly
+                  nohup .venv/bin/python '"${LOCAL_SCRIPT}"' > output.log 2>&1 &
+                  disown || true
+
+                  # small sleep and verification
+                  sleep 2
+                  if pgrep -f "python.*'"${LOCAL_SCRIPT}"'" >/dev/null 2>&1; then
+                    echo "STARTED_OK"
+                    # print a bit of the log for visibility
+                    tail -n 20 output.log || true
+                    exit 0
+                  else
+                    echo "START_FAILED"
+                    tail -n 200 output.log || true
+                    exit 2
+                  fi
+                ' 2>&1 | sed "s/^/[${ip}] /"
+
+            rc=${PIPESTATUS[0]}
+            if [ $rc -eq 0 ]; then
+              echo "✅ Deployment succeeded on $ip"
+            else
+              echo "❌ Deployment failed on $ip (exit $rc). See prefixed logs above."
+            fi
+
+            # try fetching output.log (best-effort)
+            echo "Collecting output.log from $ip (if present):"
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" "cat $(ls -d /tmp/* 2>/dev/null | head -n1)/output.log 2>/dev/null || cat ./output.log 2>/dev/null || echo 'no output.log found on host'" 2>/dev/null | sed "s/^/[${ip} output] /" || true
+          done
+
+          rm -f ec2_key.pem
