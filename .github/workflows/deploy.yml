@@ -1,4 +1,4 @@
-name: SSH and run Flask app.py (no stop existing)
+name: Clone, copy app.py and run commands on EC2
 
 on:
   push:
@@ -8,58 +8,112 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      SSH_USER: ubuntu
+      SERVERS_JSON_PATH: servers.json
+      REMOTE_DIR: python-app
+      LOCAL_SCRIPT: app.py
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repo (so app.py is available on runner)
         uses: actions/checkout@v4
 
-      - name: Install tools
-        run: sudo apt-get update -y && sudo apt-get install -y jq openssh-client
+      - name: Install runner tools
+        run: sudo apt-get update -y && sudo apt-get install -y jq rsync openssh-client
 
-      - name: SSH to EC2 and start Flask app
-        env:
-          SSH_USER: ubuntu
-          EC2_KEY: ${{ secrets.EC2_SSHKEY }}
+      - name: Write SSH key
         run: |
-          echo "$EC2_KEY" | sed 's/\r$//' > ec2_key.pem
-          chmod 600 ec2_key.pem
-
-          if [ ! -f servers.json ]; then
-            echo "❌ servers.json not found!"
+          if [ -z "${{ secrets.EC2_SSHKEY }}" ]; then
+            echo "ERROR: EC2_SSHKEY secret is empty"
             exit 1
           fi
+          echo "${{ secrets.EC2_SSHKEY }}" | sed 's/\r$//' > ec2_key.pem
+          chmod 600 ec2_key.pem
 
-          mapfile -t IPS < <(jq -r '.servers[]' servers.json)
+      - name: Validate servers.json & ensure app.py exists
+        run: |
+          if [ ! -f "$SERVERS_JSON_PATH" ]; then
+            echo "ERROR: $SERVERS_JSON_PATH not found"
+            ls -la
+            exit 1
+          fi
+          if [ ! -f "$LOCAL_SCRIPT" ]; then
+            echo "ERROR: $LOCAL_SCRIPT not found in repo root"
+            ls -la
+            exit 1
+          fi
+          echo "Servers:"
+          jq -r '.servers[]' "$SERVERS_JSON_PATH"
+
+      - name: Copy app.py and run commands on each EC2
+        env:
+          SSH_USER: ${{ env.SSH_USER }}
+          SERVERS_JSON_PATH: ${{ env.SERVERS_JSON_PATH }}
+          REMOTE_DIR: ${{ env.REMOTE_DIR }}
+          LOCAL_SCRIPT: ${{ env.LOCAL_SCRIPT }}
+        run: |
+          mapfile -t IPS < <(jq -r '.servers[]' "$SERVERS_JSON_PATH")
           if [ ${#IPS[@]} -eq 0 ]; then
-            echo "❌ No IPs found in servers.json!"
+            echo "No servers listed in $SERVERS_JSON_PATH"
             exit 1
           fi
 
           for ip in "${IPS[@]}"; do
-            echo "---- Connecting to $ip ----"
-            ssh -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -lc $'
-              set -e
-              echo "Installing Flask..."
-              sudo apt-get update -y
-              sudo apt-get install -y python3-flask
+            echo "---- Processing $ip ----"
 
-              echo "Starting app.py with nohup..."
-              nohup python3 app.py > output.log 2>&1 &
+            # create remote dir (best-effort)
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" "mkdir -p ~/${REMOTE_DIR}" || {
+              echo "❌ Could not create remote directory on $ip; skipping"
+              continue
+            }
+
+            # copy only app.py to remote
+            echo "Copying ${LOCAL_SCRIPT} to ${ip}:~/${REMOTE_DIR}/"
+            rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i ec2_key.pem" "$LOCAL_SCRIPT" "${SSH_USER}@${ip}:~/${REMOTE_DIR}/" || {
+              echo "❌ rsync failed for $ip; skipping"
+              continue
+            }
+
+            echo "Running remote commands on $ip ..."
+            # Run apt install noninteractive and start app with nohup (do NOT stop existing apps)
+            ssh -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -lc $'
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+
+              echo "Updating apt and installing python3-flask (noninteractive)..."
+              sudo apt-get update -y -qq
+              # noninteractive install to avoid debconf prompts
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
+                python3-flask || echo "WARNING: apt install returned non-zero (check)"
+
+              # ensure remote dir and move into it
+              cd ~/'"${REMOTE_DIR}"' || { echo "ERROR: cannot cd to remote dir"; exit 2; }
+
+              echo "Starting ${LOCAL_SCRIPT} with nohup (will not stop existing apps)..."
+              nohup python3 '"${LOCAL_SCRIPT}"' > output.log 2>&1 &
+
+              # brief sleep and check
               sleep 2
-
-              if pgrep -f "python3 app.py" >/dev/null; then
-                echo "✅ app.py started successfully on $(hostname)"
+              if pgrep -f "python3 '"${LOCAL_SCRIPT}"'" >/dev/null 2>&1; then
+                echo "✅ ${LOCAL_SCRIPT} started on $(hostname)"
+                tail -n 8 output.log || true
+                exit 0
               else
-                echo "⚠️ app.py started but exited immediately (check output.log)"
-                tail -n 10 output.log || true
+                echo "⚠️ ${LOCAL_SCRIPT} did not remain running on $(hostname) (check output.log)"
+                tail -n 50 output.log || true
+                exit 3
               fi
-            '
+            ' 2>&1 | sed "s/^/[${ip}] /"
+
             rc=${PIPESTATUS[0]}
             if [ $rc -eq 0 ]; then
-              echo "✅ Commands executed successfully on $ip"
+              echo "✅ Remote commands succeeded on $ip"
             else
-              echo "❌ Command failed on $ip (exit $rc)"
+              echo "❌ Remote commands failed on $ip (exit $rc)"
             fi
           done
 
-          rm -f ec2_key.pem
+      - name: Cleanup SSH key
+        if: always()
+        run: |
+          shred -u ec2_key.pem || rm -f ec2_key.pem
