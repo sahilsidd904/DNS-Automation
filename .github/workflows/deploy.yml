@@ -1,8 +1,6 @@
 name: Copy app.py, install flask, and run with nohup
 
 on:
-  push:
-    branches: [ main ]
   workflow_dispatch:
 
 jobs:
@@ -80,7 +78,7 @@ jobs:
               sudo apt-get update -y
               echo "Installing python3-flask (may prompt)..."
               sudo apt-get install -y python3-flask
-              sudo fuser -k 5000/tcp || true
+              sudo fuser -k 80/tcp || true
 
               cd ~/'"${REMOTE_DIR}"' || { echo "ERROR: cannot cd to ~/'"${REMOTE_DIR}"'"; exit 2; }
 
