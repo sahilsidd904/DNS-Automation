@@ -2,8 +2,6 @@ name: Blue/Green-style rollout (TG2 -> server1 -> TG1 -> server2 -> 50/50)
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
 
 env:
   # Replace these with your real ARNs or set as repository secrets and reference them.
