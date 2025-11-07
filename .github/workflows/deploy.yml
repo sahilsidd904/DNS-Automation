@@ -91,14 +91,14 @@ jobs:
             # ensure remote directory exists
             ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" "mkdir -p ~/${REMOTE_DIR}" || {
               echo "❌ Could not create remote directory on $ip; skipping"
-              continue
+              exit 1
             }
 
             # copy app.py
             echo "Copying ${LOCAL_SCRIPT} to ${ip}:~/${REMOTE_DIR}/"
             rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i ec2_key.pem" "$LOCAL_SCRIPT" "${SSH_USER}@${ip}:~/${REMOTE_DIR}/" || {
               echo "❌ rsync failed for $ip; skipping"
-              continue
+              exit 1
             }
 
             echo "Running remote install and start commands on $ip ..."
@@ -132,7 +132,7 @@ jobs:
             else
               echo "❌ Remote commands failed on $ip (exit $rc)"
             fi
-          done
+          
 
       - name: Cleanup SSH key
         if: always()
