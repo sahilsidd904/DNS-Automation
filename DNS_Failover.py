@@ -29,7 +29,7 @@ def modify_traffic(weight_tg1, weight_tg2):
     return response
 
 def main():
-    choice=os.environ("traffic")
+    choice=os.environ.get("traffic")
     
     if choice == "1":
         modify_traffic(1, 0)
