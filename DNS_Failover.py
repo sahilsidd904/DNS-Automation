@@ -5,9 +5,9 @@ import os
 client = boto3.client("elbv2", region_name="ap-southeast-2")  # change region if needed
 
 # Replace these ARNs with your actual values
-LISTENER_ARN = "arn:aws:elasticloadbalancing:ap-southeast-2:820345161521:listener/app/DNSAutomation/3be55bd9e1ec10c0/8b88ad7fa84aa985"
-TG1_ARN = "arn:aws:elasticloadbalancing:ap-southeast-2:820345161521:targetgroup/Targetgroup1/356f9014e7004059"
-TG2_ARN = "arn:aws:elasticloadbalancing:ap-southeast-2:820345161521:targetgroup/Targetgroup2/0f48205b9cf739c7"
+LISTENER_ARN = "arn:aws:elasticloadbalancing:ap-southeast-2:820345161521:listener/app/lb/0e7d0e802887583f/dd6a61a61f5ab6ce"
+TG1_ARN = "arn:aws:elasticloadbalancing:ap-southeast-2:820345161521:targetgroup/tg1/5ec821881ea56bfc"
+TG2_ARN = "arn:aws:elasticloadbalancing:ap-southeast-2:820345161521:targetgroup/tg2/f59fe3e806da9967"
 
 def modify_traffic(weight_tg1, weight_tg2):
     """Modify listener rule to set traffic weights."""
