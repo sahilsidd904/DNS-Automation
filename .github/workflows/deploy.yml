@@ -1,18 +1,32 @@
-name: Blue/Green-style rollout (fixed quoting)
+name: Deploy app
 
 on:
   workflow_dispatch:
 
-env:
-  AWS_REGION: ap-southeast-2
-  LISTENER_ARN: arn:aws:elasticloadbalancing:ap-southeast-2:820345161521:loadbalancer/app/lb/0e7d0e802887583f
-  TG1_ARN: arn:aws:elasticloadbalancing:ap-southeast-2:820345161521:targetgroup/tg1/5ec821881ea56bfc
-  TG2_ARN: arn:aws:elasticloadbalancing:ap-southeast-2:820345161521:targetgroup/tg2/f59fe3e806da9967
-
 jobs:
-  rollout:
+  Disable_TG1:
     runs-on: ubuntu-latest
 
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Disable TG1 Traffic
+        env:
+          traffic: 2
+        run: python3 DNS_Failover.py
+
+  approval_gate:
+    needs: Disable_TG1
+    runs-on: ubuntu-latest
+    environment:
+      name: Deploy
+    steps:
+      - run: echo "Waiting for approval..."
+  
+  deploy_server1:
+    needs: approval_gate
+    runs-on: ubuntu-latest
     env:
       SSH_USER: ubuntu
       SERVERS_JSON_PATH: servers.json
@@ -24,180 +38,93 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install runner tools
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq openssh-client rsync scp python3-pip git
-          python3 -m pip install --upgrade pip boto3
+        run: sudo apt-get update -y && sudo apt-get install -y jq rsync openssh-client
 
       - name: Write SSH key
         run: |
           if [ -z "${{ secrets.EC2_SSHKEY }}" ]; then
-            echo "EC2_SSHKEY is missing"
+            echo "ERROR: EC2_SSHKEY secret is empty"
             exit 1
           fi
           echo "${{ secrets.EC2_SSHKEY }}" | sed 's/\r$//' > ec2_key.pem
           chmod 600 ec2_key.pem
 
-      - name: Read servers (server1, server2)
-        id: servers
+      - name: Validate files
         run: |
-          if [ ! -f "${SERVERS_JSON_PATH}" ]; then
-            echo "servers.json not found"
+          if [ ! -f "$SERVERS_JSON_PATH" ]; then
+            echo "ERROR: $SERVERS_JSON_PATH not found"
+            ls -la
             exit 1
           fi
-          mapfile -t IPS < <(jq -r '.servers[]' "${SERVERS_JSON_PATH}")
-          if [ ${#IPS[@]} -lt 2 ]; then
-            echo "Need at least two servers in servers.json"
+          if [ ! -f "$LOCAL_SCRIPT" ]; then
+            echo "ERROR: $LOCAL_SCRIPT not found"
+            ls -la
             exit 1
           fi
-          echo "server1=${IPS[0]}" >> $GITHUB_OUTPUT
-          echo "server2=${IPS[1]}" >> $GITHUB_OUTPUT
+          jq -r '.servers[]' "$SERVERS_JSON_PATH"
 
-      - name: Route 100% -> TG2
+      - name: Copy app.py and install flask + run nohup (no noninteractive)
         env:
-          AWS_REGION: ${{ env.AWS_REGION }}
-          LISTENER_ARN: ${{ env.LISTENER_ARN }}
-          TG1_ARN: ${{ env.TG1_ARN }}
-          TG2_ARN: ${{ env.TG2_ARN }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+          SSH_USER: ${{ env.SSH_USER }}
+          SERVERS_JSON_PATH: ${{ env.SERVERS_JSON_PATH }}
+          REMOTE_DIR: ${{ env.REMOTE_DIR }}
+          LOCAL_SCRIPT: ${{ env.LOCAL_SCRIPT }}
         run: |
-          python3 - <<'PY'
-import boto3, os
-region = os.getenv('AWS_REGION')
-client = boto3.client('elbv2', region_name=region)
-listener_arn = os.getenv('LISTENER_ARN')
-tg1 = os.getenv('TG1_ARN')
-tg2 = os.getenv('TG2_ARN')
-print("Routing 100% -> TG2")
-resp = client.modify_listener(
-  ListenerArn=listener_arn,
-  DefaultActions=[{
-    "Type":"forward",
-    "ForwardConfig":{"TargetGroups":[{"TargetGroupArn":tg1,"Weight":0},{"TargetGroupArn":tg2,"Weight":1}]}
-  }]
-)
-print("modify_listener response status:", resp.get('ResponseMetadata',{}).get('HTTPStatusCode'))
-PY
+          ip=$(jq -r 'if (.servers | type) == "object" then .servers.DC1 elif (.servers | type) == "array" then (.servers[] | select(has("DC1")) | .DC1) else empty end' "$SERVERS_JSON_PATH")
 
-      - name: Prepare deploy script (runner)
-        run: |
-          cat > deploy_and_run.sh <<'SH'
-#!/usr/bin/env bash
-set -e
-REMOTE_DIR="{{REMOTE_DIR_PLACEHOLDER}}"
-LOCAL_SCRIPT="{{LOCAL_SCRIPT_PLACEHOLDER}}"
+          if [ -z "$ip" ] || [ "$ip" = "null" ]; then
+              echo "❌ DC1 IP not found in $SERVERS_JSON_PATH. Expected either {\"servers\": {\"DC1\": \"ip\", ...}} or {\"servers\": [{\"DC1\":\"ip\"}, ...]}"
+            exit 1
+          fi
+            echo "---- Processing $ip ----"
 
-echo "Updating apt..."
-sudo apt-get update -y
+            # ensure remote directory exists
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" "mkdir -p ~/${REMOTE_DIR}" || {
+              echo "❌ Could not create remote directory on $ip; skipping"
+              continue
+            }
 
-echo "Installing python3-flask..."
-sudo apt-get install -y python3-flask
+            # copy app.py
+            echo "Copying ${LOCAL_SCRIPT} to ${ip}:~/${REMOTE_DIR}/"
+            rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i ec2_key.pem" "$LOCAL_SCRIPT" "${SSH_USER}@${ip}:~/${REMOTE_DIR}/" || {
+              echo "❌ rsync failed for $ip; skipping"
+              continue
+            }
 
-mkdir -p "$HOME/$REMOTE_DIR"
-# app.py is expected to be copied into $HOME/$REMOTE_DIR before running this script.
-cd "$HOME/$REMOTE_DIR"
+            echo "Running remote install and start commands on $ip ..."
+            ssh -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" bash -lc $'
+              set -e
+              echo "Updating apt..."
+              sudo apt-get update -y
+              echo "Installing python3-flask..."
+              sudo apt-get install -y python3-flask
+              sudo fuser -k 5000/tcp || true
 
-echo "Starting $LOCAL_SCRIPT with nohup (will not stop existing apps)..."
-nohup python3 "$LOCAL_SCRIPT" > output.log 2>&1 &
+              cd ~/'"${REMOTE_DIR}"' || { echo "ERROR: cannot cd to ~/'"${REMOTE_DIR}"'"; exit 2; }
 
-sleep 2
-if pgrep -f "python3 $LOCAL_SCRIPT" >/dev/null 2>&1; then
-  echo "✅ $LOCAL_SCRIPT started on $(hostname)"
-  tail -n 8 output.log || true
-  exit 0
-else
-  echo "❌ $LOCAL_SCRIPT failed to start on $(hostname)"
-  tail -n 40 output.log || true
-  exit 2
-fi
-SH
-          # replace placeholders with actual values
-          sed -i "s|{{REMOTE_DIR_PLACEHOLDER}}|${REMOTE_DIR}|g" deploy_and_run.sh
-          sed -i "s|{{LOCAL_SCRIPT_PLACEHOLDER}}|${LOCAL_SCRIPT}|g" deploy_and_run.sh
-          chmod +x deploy_and_run.sh
-          ls -l deploy_and_run.sh
-          head -n 40 deploy_and_run.sh
+              echo "Starting '"${LOCAL_SCRIPT}"' with nohup..."
+              nohup python3 '"${LOCAL_SCRIPT}"' > output.log 2>&1 &
 
-      - name: Deploy to server1 (first IP)
-        env:
-          SERVER_IP: ${{ steps.servers.outputs.server1 }}
-        run: |
-          ip="${SERVER_IP}"
-          echo "Deploying to server1: ${ip}"
-          # copy app.py
-          rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i ec2_key.pem" "${LOCAL_SCRIPT}" "${SSH_USER}@${ip}:~/${REMOTE_DIR}/" || { echo "rsync app.py failed"; exit 1; }
-          # copy deploy script
-          scp -o BatchMode=yes -o StrictHostKeyChecking=no -i ec2_key.pem deploy_and_run.sh "${SSH_USER}@${ip}:~/deploy_and_run.sh" || { echo "scp script failed"; exit 2; }
-          # execute deploy script remotely
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" "bash ~/deploy_and_run.sh" 2>&1 | sed "s/^/[${ip}] /"
-      
-      - name: Route 100% -> TG1
-        env:
-          AWS_REGION: ${{ env.AWS_REGION }}
-          LISTENER_ARN: ${{ env.LISTENER_ARN }}
-          TG1_ARN: ${{ env.TG1_ARN }}
-          TG2_ARN: ${{ env.TG2_ARN }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-        run: |
-          python3 - <<'PY'
-import boto3, os
-region = os.getenv('AWS_REGION')
-client = boto3.client('elbv2', region_name=region)
-listener_arn = os.getenv('LISTENER_ARN')
-tg1 = os.getenv('TG1_ARN'); tg2 = os.getenv('TG2_ARN')
-print("Routing 100% -> TG1")
-resp = client.modify_listener(
-  ListenerArn=listener_arn,
-  DefaultActions=[{
-    "Type":"forward",
-    "ForwardConfig":{"TargetGroups":[{"TargetGroupArn":tg1,"Weight":1},{"TargetGroupArn":tg2,"Weight":0}]}
-  }]
-)
-print("modify_listener response status:", resp.get('ResponseMetadata',{}).get('HTTPStatusCode'))
-PY
+              sleep 2
+              if pgrep -f "python3 '"${LOCAL_SCRIPT}"'" >/dev/null 2>&1; then
+                echo "✅ ${LOCAL_SCRIPT} started on $(hostname)"
+                tail -n 8 output.log || true
+              else
+                echo "⚠️ ${LOCAL_SCRIPT} did not remain running on $(hostname) (check output.log)"
+                tail -n 40 output.log || true
+                exit 3
+              fi
+            ' 2>&1 | sed "s/^/[${ip}] /"
 
-      - name: Deploy to server2 (second IP)
-        env:
-          SERVER_IP: ${{ steps.servers.outputs.server2 }}
-        run: |
-          ip="${SERVER_IP}"
-          echo "Deploying to server2: ${ip}"
-          rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i ec2_key.pem" "${LOCAL_SCRIPT}" "${SSH_USER}@${ip}:~/${REMOTE_DIR}/" || { echo "rsync app.py failed"; exit 1; }
-          scp -o BatchMode=yes -o StrictHostKeyChecking=no -i ec2_key.pem deploy_and_run.sh "${SSH_USER}@${ip}:~/deploy_and_run.sh" || { echo "scp script failed"; exit 2; }
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i ec2_key.pem "${SSH_USER}@${ip}" "bash ~/deploy_and_run.sh" 2>&1 | sed "s/^/[${ip}] /"
+            rc=${PIPESTATUS[0]}
+            if [ $rc -eq 0 ]; then
+              echo "✅ Remote commands succeeded on $ip"
+            else
+              echo "❌ Remote commands failed on $ip (exit $rc)"
+            fi
+          done
 
-      - name: Route 50/50 TG1/TG2
-        env:
-          AWS_REGION: ${{ env.AWS_REGION }}
-          LISTENER_ARN: ${{ env.LISTENER_ARN }}
-          TG1_ARN: ${{ env.TG1_ARN }}
-          TG2_ARN: ${{ env.TG2_ARN }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-        run: |
-          python3 - <<'PY'
-import boto3, os
-region = os.getenv('AWS_REGION')
-client = boto3.client('elbv2', region_name=region)
-listener_arn = os.getenv('LISTENER_ARN')
-tg1 = os.getenv('TG1_ARN'); tg2 = os.getenv('TG2_ARN')
-print("Routing 50/50")
-resp = client.modify_listener(
-  ListenerArn=listener_arn,
-  DefaultActions=[{
-    "Type":"forward",
-    "ForwardConfig":{"TargetGroups":[{"TargetGroupArn":tg1,"Weight":1},{"TargetGroupArn":tg2,"Weight":1}]}
-  }]
-)
-print("modify_listener response status:", resp.get('ResponseMetadata',{}).get('HTTPStatusCode'))
-PY
-
-      - name: Cleanup
+      - name: Cleanup SSH key
         if: always()
         run: |
-          rm -f ec2_key.pem deploy_and_run.sh
+          shred -u ec2_key.pem || rm -f ec2_key.pem
