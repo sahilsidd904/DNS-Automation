@@ -141,6 +141,7 @@ jobs:
 
       
   Disable_TG2:
+    needs: deploy_server1
     runs-on: ubuntu-latest
 
     steps:
