@@ -1,4 +1,5 @@
 import boto3
+import os
 
 # Initialize boto3 client
 client = boto3.client("elbv2", region_name="ap-southeast-2")  # change region if needed
@@ -28,12 +29,7 @@ def modify_traffic(weight_tg1, weight_tg2):
     return response
 
 def main():
-    print("=== ALB Traffic Control ===")
-    print("1. Route 100% to TargetGroup1")
-    print("2. Route 100% to TargetGroup2")
-    print("3. Route 50/50 between TG1 and TG2")
-    
-    choice = input("Enter your choice (1/2/3): ").strip()
+    choice=os.environ("traffic")
     
     if choice == "1":
         modify_traffic(1, 0)
