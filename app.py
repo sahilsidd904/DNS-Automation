@@ -133,7 +133,7 @@ TEMPLATE = """
         <div class="poster" style="background-image:url('https://picsum.photos/seed/hero/800/450')"></div>
         <div class="meta">
           <h1>Featured: The Sample Story</h1>
-          <p>Watch critically acclaimed sample series. A demo layout to showcase a streaming grid, hero and playback button.</p>
+          <p>Watch the critically acclaimed sample series. A demo layout to showcase a streaming grid, hero and playback button.</p>
           <div style="display:flex;gap:12px;align-items:center">
             <a class="btn" href="#">Play</a>
             <div style="color:var(--muted)">• 2h 12m • 2024 • Drama</div>
